@@ -4,10 +4,13 @@ from typing import Any
 
 
 def summarize_batches(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    sealed = [r for r in rows if str(r.get("status") or "") in {"sealed", "superseded"}]
-    pendingish = [r for r in rows if str(r.get("status") or "") in {"draft", "failed"}]
+    # 现行标记只认 sealed：voided 是墓碑，绝不计入现行集合
+    sealed = [r for r in rows if str(r.get("status") or "") == "sealed"]
+    voided = [r for r in rows if str(r.get("status") or "") == "voided"]
+    pendingish = [r for r in rows if str(r.get("status") or "") == "sealing"]
     return {
         "sealed_count": len(sealed),
+        "voided_count": len(voided),
         "draft_count": len(pendingish),
         "ids": [r.get("id") for r in sealed],
         "days": sorted({str(r.get("business_day") or "") for r in sealed}),
@@ -17,7 +20,7 @@ def summarize_batches(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def overlay_dashboard(payload: dict[str, Any], batches: list[dict[str, Any]]) -> dict[str, Any]:
     out = dict(payload)
     summary = summarize_batches(batches)
-    out["close_batch_count"] = summary["sealed_count"] + summary["draft_count"]
+    out["close_batch_count"] = len(batches)
     out["sealed_days"] = summary["days"]
     out["alignment_token"] = "|".join(summary["days"]) if summary["days"] else ""
     return out

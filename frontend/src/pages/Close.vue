@@ -63,6 +63,23 @@ async function sealDay() {
   } catch (e) { err.value = e.message } finally { busy.value = '' }
 }
 
+// 作废血缘收敛：日批作废级联释放其引用机批；机批作废驱动父日批一并作废
+async function voidBatch(b) {
+  const hint = b.scope === 'day'
+    ? '其引用的机批将一并作废释放，全日可重写'
+    : '引用它的日批将连同快照与合计一并作废'
+  if (!confirm(`确认作废批次 ${b.batch_no}（${b.scope === 'day' ? '日级' : `机级·${b.till_code}`}）？${hint}。`)) return
+  msg.value = ''; err.value = ''; busy.value = `void-${b.id}`
+  try {
+    const r = await api.voidBatch(b.id)
+    const extra = r.scope === 'day'
+      ? (r.cascaded_till_codes?.length ? `，级联释放机批：${r.cascaded_till_codes.join(', ')}` : '')
+      : (r.parent_day_batch_id ? '，父级日批已一并作废' : '')
+    msg.value = `批次 ${r.batch_no} 已作废${extra}`
+    await load()
+  } catch (e) { err.value = e.message } finally { busy.value = '' }
+}
+
 onMounted(load)
 
 function tillRefHint(batch) {
@@ -192,7 +209,7 @@ function precheckView(p) {
     <h2>封账批次</h2>
     <table>
       <thead>
-        <tr><th>批次</th><th>营业日</th><th>范围</th><th>系统</th><th>实盘</th><th>差额</th><th>锁粒度</th><th>状态</th></tr>
+        <tr><th>批次</th><th>营业日</th><th>范围</th><th>系统</th><th>实盘</th><th>差额</th><th>锁粒度</th><th>引用机批</th><th>状态</th><th>操作</th></tr>
       </thead>
       <tbody>
         <tr v-for="b in batches" :key="b.id">
@@ -201,7 +218,14 @@ function precheckView(p) {
           <td>{{ b.system_total.toFixed(2) }}</td><td>{{ b.declared_cash.toFixed(2) }}</td>
           <td>{{ b.variance.toFixed(2) }}</td>
           <td>{{ b.locked_day ? '全日锁' : '单机锁' }}</td>
+          <td>{{ b.scope === 'day' ? (tillRefHint(b).join(', ') || '—') : '—' }}</td>
           <td><span class="tag" :class="b.status === 'sealed' ? 'ok' : 'warn'">{{ b.status }}</span></td>
+          <td>
+            <button v-if="b.status === 'sealed'" class="btn ghost" :disabled="busy === `void-${b.id}`"
+              @click="voidBatch(b)">
+              {{ busy === `void-${b.id}` ? '作废中…' : '作废' }}
+            </button>
+          </td>
         </tr>
       </tbody>
     </table>

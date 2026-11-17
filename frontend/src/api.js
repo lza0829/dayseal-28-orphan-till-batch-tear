@@ -23,6 +23,7 @@ export const api = {
   closePreview: (day) => req('/api/close/preview' + (day ? `?business_day=${encodeURIComponent(day)}` : '')),
   seal: (body) => req('/api/close/seal', { method: 'POST', body: JSON.stringify(body) }),
   sealTill: (body) => req('/api/close/seal-till', { method: 'POST', body: JSON.stringify(body) }),
+  voidBatch: (batch_id) => req('/api/close/void', { method: 'POST', body: JSON.stringify({ batch_id }) }),
   batches: () => req('/api/close/batches'),
   variances: () => req('/api/close/variances'),
   getDay: () => req('/api/settings/business-day'),

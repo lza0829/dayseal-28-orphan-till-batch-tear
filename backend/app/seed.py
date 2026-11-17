@@ -38,7 +38,18 @@ CREATE TABLE IF NOT EXISTS close_batches (
   locked_day INTEGER NOT NULL DEFAULT 1,
   locked_till INTEGER NOT NULL DEFAULT 0,
   sealed_at TEXT NOT NULL,
+  voided_at TEXT,
+  void_reason TEXT,
   note TEXT
+);
+-- 子父批血缘：日批 → 机批的引用（含封账时点分机快照金额）
+CREATE TABLE IF NOT EXISTS close_batch_refs (
+  id INTEGER PRIMARY KEY,
+  day_batch_id INTEGER NOT NULL,
+  till_batch_id INTEGER NOT NULL,
+  till_code TEXT NOT NULL,
+  system_total REAL NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS variance_rows (
   id INTEGER PRIMARY KEY,
@@ -72,10 +83,15 @@ CREATE TABLE IF NOT EXISTS close_waives (
 '''
 
 # 索引统一由 migrate() 在列补齐之后创建（旧库直接建局部索引会因缺列失败）
+# 现行唯一：只有 sealing/sealed 占用唯一位；voided 墓碑不阻塞作废后重封。
 INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_cash_lines_day_till ON cash_lines(business_day, till_code)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_day_batch ON close_batches(business_day) WHERE scope='day'",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_till_batch ON close_batches(business_day, till_code) WHERE scope='till'",
+    "DROP INDEX IF EXISTS uq_day_batch",
+    "DROP INDEX IF EXISTS uq_till_batch",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_day_batch_current ON close_batches(business_day) WHERE scope='day' AND status IN ('sealing','sealed')",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_till_batch_current ON close_batches(business_day, till_code) WHERE scope='till' AND status IN ('sealing','sealed')",
+    "CREATE INDEX IF NOT EXISTS idx_refs_day ON close_batch_refs(day_batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_refs_till ON close_batch_refs(till_batch_id)",
 ]
 
 
@@ -98,6 +114,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         "lock_state": "TEXT NOT NULL DEFAULT 'sealed'",
         "locked_day": "INTEGER NOT NULL DEFAULT 1",
         "locked_till": "INTEGER NOT NULL DEFAULT 0",
+        "voided_at": "TEXT",
+        "void_reason": "TEXT",
     })
     _add_columns(conn, "variance_rows", {
         "scope": "TEXT NOT NULL DEFAULT 'day'",
@@ -111,6 +129,16 @@ def migrate(conn: sqlite3.Connection) -> None:
              batch_id INTEGER,
              created_at TEXT NOT NULL,
              UNIQUE(business_day, till_code)
+           )'''
+    )
+    conn.execute(
+        '''CREATE TABLE IF NOT EXISTS close_batch_refs (
+             id INTEGER PRIMARY KEY,
+             day_batch_id INTEGER NOT NULL,
+             till_batch_id INTEGER NOT NULL,
+             till_code TEXT NOT NULL,
+             system_total REAL NOT NULL,
+             created_at TEXT NOT NULL
            )'''
     )
     for ddl in INDEX_DDL:

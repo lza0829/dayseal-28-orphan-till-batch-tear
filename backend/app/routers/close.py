@@ -21,6 +21,12 @@ def seal_till(body: dict = Body(...)):
     return svc.seal_till(body)
 
 
+@router.post("/void")
+def void_batch(body: dict = Body(...)):
+    """作废批次：日批作废级联释放其引用机批；机批作废驱动父日批血缘收敛。"""
+    return svc.void_batch(body)
+
+
 @router.get("/batches")
 def batches():
     return svc.list_batches()

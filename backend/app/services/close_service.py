@@ -38,15 +38,107 @@ def _money(x: float) -> float:
     return round(float(x) + 1e-9, 2)
 
 
+# ================================================================ 血缘对账（子批力）
+
+def _void_day_batch(
+    conn, batch: dict[str, Any], *, cascade_tills: bool, voided_at: str, reason: str
+) -> dict[str, Any]:
+    """作废日批并同事务收敛子批侧：引用、分机快照、收口登记、长短款与现行标记一起清理。
+
+    cascade_tills=True（用户主动作废）：级联作废所引用的机批、释放机锁——
+    禁止「日批作废、机批残留现行拒写」。
+    cascade_tills=False（血缘撕裂 liar-void）：机级 sealed 集合是权威，机批不动。
+    """
+    ref_rows = cr.list_ref_rows(conn, batch["id"])
+    voided_tills: list[str] = []
+    if cascade_tills and not batch_lineage.keep_till_lock_after_void_day():
+        for r in ref_rows:
+            tb = cr.get_batch(conn, int(r["till_batch_id"]))
+            if tb and tb["status"] == cr.SEALED:
+                cr.mark_voided(conn, tb["id"], voided_at, reason="cascade_day_void")
+                cr.void_variances_for_batch(conn, tb["id"])
+                voided_tills.append(str(tb["till_code"]))
+    cr.delete_refs_for_day_batch(conn, batch["id"])
+    cr.delete_waives_for_batch(conn, batch["id"])
+    cr.void_variances_for_batch(conn, batch["id"])
+    cr.mark_voided(conn, batch["id"], voided_at, reason=reason)
+    return {"batch_id": batch["id"], "voided_till_codes": sorted(voided_tills)}
+
+
+def _void_till_batch(
+    conn, batch: dict[str, Any], *, voided_at: str, reason: str
+) -> dict[str, Any]:
+    """作废机批：引用它的现行日批血缘即撕裂（快照与合计不再成立），
+    按子批力作废该日批（不级联兄弟机批——机级 sealed 集合是权威）。"""
+    cr.mark_voided(conn, batch["id"], voided_at, reason=reason)
+    cr.void_variances_for_batch(conn, batch["id"])
+    parent = cr.find_day_batch_referencing_till(conn, batch["id"])
+    parent_voided: dict[str, Any] | None = None
+    if parent is not None:
+        parent_voided = _void_day_batch(
+            conn, parent, cascade_tills=False, voided_at=voided_at, reason="lineage_tear"
+        )
+    return {"batch_id": batch["id"], "parent_day_voided": parent_voided}
+
+
+def _reconcile_lineage_conn(conn) -> list[int]:
+    """子批力对账：现行日批的血缘必须与机级 sealed 集合一致——
+    缺引用、分机快照≠真实机封集合、日合计≠机合计之和，任一撕裂即作废日批
+    （机批是权威，不动）。返回被作废的日批 id。"""
+    if not batch_lineage.day_needs_till_refs():
+        return []
+    voided: list[int] = []
+    for batch in cr.list_current_day_batches(conn):
+        day = batch["business_day"]
+        live_codes = cr.sealed_till_codes(conn, day)
+        ref_codes = {r["till_code"] for r in cr.list_ref_rows(conn, batch["id"])}
+        # 日批无引用 / 快照≠机封集合 / 引用悬空（机批已作废）——同一条不变量
+        torn = ref_codes != live_codes
+        if not torn and live_codes:
+            live_sum = _money(
+                sum(
+                    float(b["system_total"])
+                    for b in cr.list_till_batches(conn, day)
+                    if b["till_code"] in live_codes
+                )
+            )
+            # 加总撕裂：日合计 ≠ 机合计之和，禁止双现行撒谎
+            torn = abs(live_sum - _money(float(batch["system_total"]))) >= _EPS
+        if torn:
+            _void_day_batch(
+                conn, batch, cascade_tills=False, voided_at=_now(), reason="lineage_tear"
+            )
+            voided.append(int(batch["id"]))
+    return voided
+
+
+def reconcile_lineage() -> dict[str, Any]:
+    """独立事务的血缘对账入口：启动时与读视图懒触发共用。"""
+    conn = connect(immediate=True)
+    try:
+        voided = _reconcile_lineage_conn(conn)
+        conn.commit()
+        return {"voided_day_batch_ids": voided}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ================================================================ 预览
 
 def preview(business_day: str | None = None) -> dict[str, Any]:
+    reconcile_lineage()  # 懒对账：任何撕裂在进入读视图前先收敛，禁止双现行展示
     conn = connect()
     try:
         day = _day(conn, business_day)
         strategy = _strategy(conn)
         total, count = line_repo.day_total(conn, day)
         day_batch = cr.get_day_batch(conn, day)
+        if day_batch is not None:
+            # 日批分机快照（血缘引用）随批次一起暴露
+            day_batch["till_refs"] = cr.list_day_till_refs(conn, day_batch["id"])
         per_till = line_repo.day_summary_by_till(conn, day)
         till_batches = {b["till_code"]: b for b in cr.list_till_batches(conn, day)}
         sealed_codes = cr.sealed_till_codes(conn, day)
@@ -96,7 +188,8 @@ def preview(business_day: str | None = None) -> dict[str, Any]:
         return {
             "business_day": day,
             "strategy": strategy,
-            "system_total": batch_lineage.day_sum_ignore_tills(preview_total, 0),
+            # 同源口径：日合计与机封合计并列呈现、显式比较，绝不互相吞并
+            "system_total": batch_lineage.day_total_reconciled(preview_total, sealed_till_sum),
             "line_count": count,
             "sealed": day_sealed,
             "day_batch": day_batch,
@@ -174,6 +267,7 @@ def _seal_store_day(conn, day: str, body: dict[str, Any]) -> dict[str, Any]:
 def seal_till(body: dict[str, Any]) -> dict[str, Any]:
     conn = connect(immediate=True)  # 写锁互斥：与日封/其他机封/流水写串行
     try:
+        _reconcile_lineage_conn(conn)  # 写前对账：撕裂的现行日批先作废再判定
         day = _day(conn, body.get("business_day"))
         strategy = _strategy(conn)
         if strategy != STRATEGY_TILL:
@@ -262,7 +356,7 @@ def _seal_till_day(conn, day: str, body: dict[str, Any]) -> dict[str, Any]:
     active = line_repo.active_till_codes(conn, day)
     sealed_codes = cr.sealed_till_codes(conn, day)
 
-    # 1) 活跃机必须全部已机封；缺机则日封失败
+    # 1) 活跃机必须全部已机封；缺机则日封失败（孤儿机批/缺机永不放行）
     missing_active = sorted(active - sealed_codes)
     if missing_active and not batch_lineage.orphan_tills_ok(missing_active):
         raise HTTPException(
@@ -291,8 +385,8 @@ def _seal_till_day(conn, day: str, body: dict[str, Any]) -> dict[str, Any]:
     # 3) 日级系统合计 = 流水合计；且必须等于各机已封合计之和（禁止二次累加）
     day_total, day_count = line_repo.day_total(conn, day)
     day_total = _money(day_total)
-    sealed_rows = cr.list_till_batches(conn, day)
-    sealed_sum = _money(sum(float(b["system_total"]) for b in sealed_rows if b["till_code"] in sealed_codes))
+    sealed_rows = [b for b in cr.list_till_batches(conn, day) if b["till_code"] in sealed_codes]
+    sealed_sum = _money(sum(float(b["system_total"]) for b in sealed_rows))
     if abs(day_total - sealed_sum) >= _EPS:
         raise HTTPException(
             409,
@@ -320,6 +414,18 @@ def _seal_till_day(conn, day: str, body: dict[str, Any]) -> dict[str, Any]:
         sealed_at=sealed_at,
         note=body.get("note"),
     )
+    # 4) 血缘落库：日批必须引用当日全部机级 sealed 批（子批力：机封集合是权威），
+        #    引用行同时固化封账时点的分机快照（机号 + 机封金额）
+    if batch_lineage.day_needs_till_refs():
+        for b in sealed_rows:
+            cr.add_ref(
+                conn,
+                day_batch_id=batch_id,
+                till_batch_id=b["id"],
+                till_code=b["till_code"],
+                system_total=float(b["system_total"]),
+                created_at=sealed_at,
+            )
     # 日级长短款 = 整店实盘 - 日系统合计；机级长短款已在机封时各自落账
     disposition = "balanced" if abs(variance) < _EPS else "pending"
     cr.add_variance(
@@ -346,6 +452,7 @@ def _seal_till_day(conn, day: str, body: dict[str, Any]) -> dict[str, Any]:
         "variance": variance,
         "line_count": day_count,
         "sealed_till_count": len(sealed_codes),
+        "till_refs": sorted(sealed_codes),
         "waived_tills": sorted(inactive),
         "status": cr.SEALED,
         "disposition": disposition,
@@ -360,6 +467,7 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
         pass
     conn = connect(immediate=True)  # 全日写互斥：日封与任一机封不可能并行写同一营业日
     try:
+        _reconcile_lineage_conn(conn)  # 写前对账：撕裂的现行日批先作废再判定
         day = _day(conn, body.get("business_day"))
         strategy = _strategy(conn)
         if strategy == STRATEGY_STORE:
@@ -375,12 +483,76 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
         conn.close()
 
 
+# ================================================================ 作废（血缘收敛）
+
+def void_batch(body: dict[str, Any]) -> dict[str, Any]:
+    """作废批次并驱动另一侧收敛：
+    - 作废日批：级联作废其引用的机批，引用/快照/收口/长短款/现行标记一起清理；
+    - 作废机批：引用它的现行日批血缘即撕裂，日批连同快照与合计一起作废。
+    作废后该营业日可重新机封/日封（voided 墓碑不占用唯一位、不持锁）。
+    """
+    conn = connect(immediate=True)
+    try:
+        batch_id = body.get("batch_id")
+        if batch_id is None:
+            raise HTTPException(400, "必须指定 batch_id")
+        batch = cr.get_batch(conn, int(batch_id))
+        if not batch:
+            raise HTTPException(404, "批次不存在")
+        if batch["status"] != cr.SEALED:
+            raise HTTPException(
+                409, f"批次 {batch['batch_no']} 当前状态为 {batch['status']}，仅 sealed 批次可作废"
+            )
+        voided_at = _now()
+        if batch["scope"] == cr.DAY:
+            r = _void_day_batch(conn, batch, cascade_tills=True, voided_at=voided_at, reason="user_void")
+            result = {
+                "voided": True,
+                "batch_id": batch["id"],
+                "batch_no": batch["batch_no"],
+                "scope": cr.DAY,
+                "business_day": batch["business_day"],
+                "cascaded_till_codes": r["voided_till_codes"],
+                "till_refs_after": cr.orphan_refs_after_void(conn, batch["id"]),
+                "voided_at": voided_at,
+            }
+        else:
+            r = _void_till_batch(conn, batch, voided_at=voided_at, reason="user_void")
+            parent = r["parent_day_voided"]
+            result = {
+                "voided": True,
+                "batch_id": batch["id"],
+                "batch_no": batch["batch_no"],
+                "scope": cr.TILL,
+                "till_code": batch["till_code"],
+                "business_day": batch["business_day"],
+                "parent_day_batch_id": parent["batch_id"] if parent else None,
+                "voided_at": voided_at,
+            }
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ================================================================ 列表
 
 def list_batches() -> list[dict[str, Any]]:
+    reconcile_lineage()  # 懒对账：批次视图不展示撕裂的现行双轨
     conn = connect()
     try:
-        return cr.list_batches(conn)
+        rows = cr.list_batches(conn)
+        for b in rows:
+            # 现行日批附带分机快照（血缘引用）；voided 墓碑引用已弃置，恒为空
+            b["till_refs"] = (
+                cr.list_day_till_refs(conn, b["id"])
+                if b.get("scope") == cr.DAY and b.get("status") == cr.SEALED
+                else []
+            )
+        return rows
     finally:
         conn.close()
 
@@ -412,4 +584,3 @@ def seal_precheck(body: dict) -> dict:
         "lineage_ok": fence_mod.lineage_ok([]),
         "bypass": fence_mod.bypass_matrix(),
     }
-
