@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node / 前端构建
+node_modules/
+dist/
+
+# 运行时数据
+data/
+*.db
